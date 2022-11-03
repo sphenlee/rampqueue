@@ -1,0 +1,15 @@
+[package]
+name = "rampqueue"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4.17"
+redis = { version = "0.22.1", features = ["tokio-comp", "streams"] }
+thiserror = "1.0.37"
+tokio = { version = "1.21.2", features = ["full"] }
+uuid = { version = "1.2.1", features = ["v4"] }
+
+[dev-dependencies]
+clap = { version = "4.0.18", features = ["derive"] }
+env_logger = "0.9.1"
