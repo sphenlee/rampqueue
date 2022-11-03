@@ -5,6 +5,7 @@ use redis::streams::{
     StreamPendingCountReply, StreamReadOptions, StreamReadReply,
 };
 use redis::{AsyncCommands, Client, Cmd, FromRedisValue, IntoConnectionInfo, RedisError, Value};
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -16,30 +17,42 @@ pub enum Error {
 
     #[error("message is missing payload")]
     NoPayload,
+
+    #[error("priority queue redeclared with different number of levels")]
+    PriorityQueueConflict,
 }
 
 pub struct Connection {
     client: Client,
     redis: redis::aio::Connection,
+    ns: String,
+    priority_queues: HashMap<String, u8>,
 }
 
-fn get_steam_name(queue: &str) -> String {
-    format!("rampqueue.{}", queue)
+fn get_steam_name(ns: &str, queue: &str) -> String {
+    format!("{}.{}", ns, queue)
+}
+
+fn get_priority_steam_name(ns: &str, queue: &str, priority: u8) -> String {
+    format!("{}.{}.{}", ns, queue, priority)
 }
 
 impl Connection {
-    pub async fn new<T: IntoConnectionInfo>(params: T) -> Result<Connection, Error> {
+    pub async fn new<T: IntoConnectionInfo>(
+        params: T,
+        namespace: impl Into<String>,
+    ) -> Result<Connection, Error> {
         let client = Client::open(params)?;
         let conn = client.get_tokio_connection().await?;
         Ok(Connection {
             client,
             redis: conn,
+            ns: namespace.into(),
+            priority_queues: HashMap::new(),
         })
     }
 
-    pub async fn declare_queue(&mut self, queue_name: &str) -> Result<(), Error> {
-        let key = get_steam_name(queue_name);
-        trace!("declare queue: key={}", key);
+    async fn do_declare_queue(&mut self, key: &str) -> Result<(), Error> {
         self.redis
             .xgroup_create_mkstream(key, "primary", "$")
             .await
@@ -55,17 +68,71 @@ impl Connection {
         Ok(())
     }
 
-    pub async fn publish(&mut self, queue_name: &str, msg: Message) -> Result<(), Error> {
-        let key = get_steam_name(queue_name);
+    pub async fn declare_queue(&mut self, queue_name: &str) -> Result<(), Error> {
+        let key = get_steam_name(&self.ns, queue_name);
+        trace!("declare queue: key={}", key);
+        self.do_declare_queue(&key).await
+    }
+
+    pub async fn declare_priority_queue(
+        &mut self,
+        queue_name: &str,
+        levels: u8,
+    ) -> Result<(), Error> {
+        let existing_levels = *self
+            .priority_queues
+            .entry(queue_name.to_owned())
+            .or_insert(levels);
+        if existing_levels != levels {
+            return Err(Error::PriorityQueueConflict);
+        }
+
+        for i in 0..levels {
+            let key = get_priority_steam_name(&self.ns, queue_name, i);
+            trace!("declare priority queue: key={}", key);
+            self.do_declare_queue(&key).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn do_publish(&mut self, key: &str, msg: Message) -> Result<(), Error> {
         self.redis
             .xadd(key, "*", &[("payload", msg.payload)])
             .await?;
         Ok(())
     }
 
+    pub async fn publish(&mut self, queue_name: &str, msg: Message) -> Result<(), Error> {
+        let key = get_steam_name(&self.ns, queue_name);
+        self.do_publish(&key, msg).await
+    }
+
+    pub async fn publish_priority(
+        &mut self,
+        queue_name: &str,
+        msg: Message,
+        priority: u8,
+    ) -> Result<(), Error> {
+        let key = get_priority_steam_name(&self.ns, queue_name, priority);
+        self.do_publish(&key, msg).await
+    }
+
     pub async fn consume(&mut self, queue_name: &str) -> Result<Consumer, Error> {
-        self.consume_named(queue_name, uuid::Uuid::new_v4().to_string())
-            .await
+        let consumer = uuid::Uuid::new_v4().to_string();
+
+        match self.priority_queues.get(queue_name) {
+            None => {
+                let key = get_steam_name(&self.ns, queue_name);
+                self.do_consume(vec![key], consumer).await
+            }
+            Some(&levels) => {
+                let keys = (0..levels)
+                    .map(|i| get_priority_steam_name(&self.ns, queue_name, i))
+                    .collect();
+                self.do_consume(keys, consumer).await
+            }
+        }
     }
 
     pub async fn consume_named(
@@ -73,10 +140,19 @@ impl Connection {
         queue_name: &str,
         consumer: impl Into<String>,
     ) -> Result<Consumer, Error> {
+        let key = get_steam_name(&self.ns, queue_name);
+        self.do_consume(vec![key], consumer).await
+    }
+
+    async fn do_consume(
+        &mut self,
+        keys: Vec<String>,
+        consumer: impl Into<String>,
+    ) -> Result<Consumer, Error> {
         Ok(Consumer {
             redis: self.client.get_tokio_connection().await?,
-            last_id: Some("0-0".to_owned()),
-            key: get_steam_name(queue_name),
+            last_id: std::iter::repeat("0-0".to_owned()).take(keys.len()).collect(),
+            keys,
             group: "primary".to_owned(),
             consumer: consumer.into(),
             next_maintenance: Instant::now(),
@@ -88,8 +164,8 @@ const CONSUMER_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 pub struct Consumer {
     redis: redis::aio::Connection,
-    last_id: Option<String>,
-    key: String,
+    last_id: Vec<String>,
+    keys: Vec<String>,
     group: String,
     consumer: String,
     next_maintenance: Instant,
@@ -98,7 +174,7 @@ pub struct Consumer {
 impl Debug for Consumer {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Consumer")
-            .field("key", &self.key)
+            .field("keys", &self.keys)
             .field("group", &self.group)
             .field("consumer", &self.consumer)
             .finish()
@@ -106,7 +182,7 @@ impl Debug for Consumer {
 }
 
 // TODO - make both of these configurable for the consumer
-const CHECK_PENDING: usize = 60 * 1000;
+const READ_BLOCK_TIMEOUT: usize = 60 * 1000;
 const IDLE_TIMEOUT: usize = 5 * 60 * 1000;
 const CONSUMER_IDLE_MULTIPLIER: usize = 3;
 
@@ -116,43 +192,112 @@ impl Consumer {
 
         loop {
             if self.next_maintenance < Instant::now() {
-                self.next_maintenance += CONSUMER_MAINTENANCE_INTERVAL;
-
-                trace!("running maintenance");
-                let info: StreamInfoConsumersReply =
-                    self.redis.xinfo_consumers(&self.key, &self.group).await?;
-                for consumer in info.consumers {
-                    if consumer.idle > IDLE_TIMEOUT * CONSUMER_IDLE_MULTIPLIER {
-                        trace!("consumer {} has been idle too long", consumer.name);
-                        self.redis
-                            .xgroup_delconsumer(&self.key, &self.group, consumer.name)
-                            .await?;
-                    }
-                }
-
-                let groups: StreamInfoGroupsReply = self.redis.xinfo_groups(&self.key).await?;
-                let min_id = groups.groups.into_iter().map(|g| g.last_delivered_id).min();
-                if let Some(id) = min_id {
-                    trace!("trimming entries older than {}", id);
-                    let mut cmd = Cmd::new();
-                    cmd.arg("XTRIM")
-                        .arg(&self.key)
-                        .arg("MINID")
-                        .arg("~")
-                        .arg(id);
-                    let value = self.redis.req_packed_command(&cmd).await?;
-                    let trimmed = usize::from_redis_value(&value)?;
-                    trace!("trimmed {} entries", trimmed);
-                }
-
-                trace!("next maintenance in {:?}", CONSUMER_MAINTENANCE_INTERVAL);
+                self.do_maintenance().await?;
             }
 
-            trace!("check pending entries");
+            if let Some(delivery) = self.check_pending().await? {
+                return Ok(delivery);
+            }
 
+            let options = StreamReadOptions::default()
+                .group(&self.group, &self.consumer)
+                .block(READ_BLOCK_TIMEOUT)
+                .count(1);
+
+            trace!("read from id: {:?}", self.last_id);
+            let read: Option<StreamReadReply> = self.redis
+                .xread_options(&self.keys, &self.last_id, &options)
+                .await?;
+
+            if !read.is_some() {
+                trace!("no entries read within timeout, check pending again");
+                continue;
+            }
+            let read = read.unwrap();
+
+            let iter = read.keys
+                .into_iter()
+                .zip(self.last_id.iter_mut());
+            for (key, last_id) in iter {
+                if key.ids.is_empty() {
+                    trace!("no entries returned for {}, wait for new entries", key.key);
+                    *last_id = ">".to_owned();
+                    continue;
+                }
+
+                let msg = &key.ids[0];
+                trace!("read entry, next id is: {}", msg.id);
+                *last_id = msg.id.clone();
+
+                return Delivery::from_stream_id(key.key, msg);
+            }
+
+            trace!("no entries returned for any key");
+        }
+    }
+
+    pub async fn ack(&mut self, delivery: &Delivery) -> Result<(), Error> {
+        trace!("ack'ing entry: {}", delivery.delivery_tag);
+        self.redis
+            .xack(&delivery.key, &self.group, &[&delivery.delivery_tag])
+            .await?;
+        Ok(())
+    }
+
+    async fn do_maintenance(&mut self) -> Result<(), Error> {
+        self.next_maintenance += CONSUMER_MAINTENANCE_INTERVAL;
+
+        trace!("running maintenance");
+        for key in &self.keys {
+            let info: StreamInfoConsumersReply =
+                self.redis.xinfo_consumers(key, &self.group).await?;
+            for consumer in info.consumers {
+                if consumer.idle > IDLE_TIMEOUT * CONSUMER_IDLE_MULTIPLIER {
+                    trace!("consumer {} has been idle too long", consumer.name);
+                    self.redis
+                        .xgroup_delconsumer(key, &self.group, consumer.name)
+                        .await?;
+                }
+            }
+
+            let groups: StreamInfoGroupsReply = self.redis.xinfo_groups(key).await?;
+            let min_id = groups.groups.into_iter().map(|g| g.last_delivered_id).min();
+            if let Some(id) = min_id {
+                trace!("trimming entries older than {}", id);
+                let mut cmd = Cmd::new();
+                cmd.arg("XTRIM")
+                    .arg(key)
+                    .arg("MINID")
+                    .arg("~")
+                    .arg(id);
+                let value = self.redis.req_packed_command(&cmd).await?;
+                let trimmed = usize::from_redis_value(&value)?;
+                trace!("trimmed {} entries", trimmed);
+            }
+        }
+
+        trace!("next maintenance in {:?}", CONSUMER_MAINTENANCE_INTERVAL);
+        Ok(())
+    }
+
+    async fn check_pending(&mut self) -> Result<Option<Delivery>, Error> {
+        for key in self.keys.clone() {
+            match self.check_one_pending(&key).await? {
+                Some(delivery) => return Ok(Some(delivery)),
+                None => continue,
+            };
+        }
+
+        Ok(None)
+    }
+
+    async fn check_one_pending(&mut self, key: &str) -> Result<Option<Delivery>, Error> {
+        trace!("check pending entries for {}", key);
+
+        loop {
             let mut cmd = Cmd::new();
             cmd.arg("XPENDING")
-                .arg(&self.key)
+                .arg(key)
                 .arg(&self.group)
                 .arg("IDLE")
                 .arg(IDLE_TIMEOUT)
@@ -168,7 +313,7 @@ impl Consumer {
                 let mut claim: StreamClaimReply = self
                     .redis
                     .xclaim(
-                        &self.key,
+                        key,
                         &self.group,
                         &self.consumer,
                         IDLE_TIMEOUT,
@@ -178,72 +323,31 @@ impl Consumer {
 
                 if let Some(entry) = claim.ids.pop() {
                     trace!("claimed entry: id={}", entry.id);
-                    return Delivery::from_stream_id(&entry);
+                    let delivery = Delivery::from_stream_id(key.to_owned(),&entry)?;
+                    return Ok(Some(delivery));
                 } else {
                     trace!("someone else claimed it, try again");
                     continue;
                 }
+            } else {
+                trace!("no more pending entries");
+                return Ok(None);
             }
-
-            trace!("no pending entries, start reading");
-
-            let options = StreamReadOptions::default()
-                .group(&self.group, &self.consumer)
-                .block(CHECK_PENDING)
-                .count(1);
-
-            let read: Option<StreamReadReply> = match self.last_id.take() {
-                Some(id) => {
-                    trace!("resume read from id: {}", id);
-                    self.redis
-                        .xread_options(&[&self.key], &[id], &options)
-                        .await?
-                }
-                None => {
-                    trace!("read new entries: '>'");
-                    self.redis
-                        .xread_options(&[&self.key], &[">"], &options)
-                        .await?
-                }
-            };
-
-            if !read.is_some() {
-                trace!("no entries read within timeout, check pending again");
-                continue;
-            }
-            let read = read.unwrap();
-
-            if read.keys[0].ids.is_empty() {
-                trace!("no entries returned, wait for new entries");
-                continue;
-            }
-
-            let msg = &read.keys[0].ids[0];
-            trace!("read entry, next id is: {}", msg.id);
-            self.last_id = Some(msg.id.clone());
-
-            return Delivery::from_stream_id(msg);
         }
-    }
-
-    pub async fn ack(&mut self, delivery_tag: &str) -> Result<(), Error> {
-        trace!("ack'ing entry: {}", delivery_tag);
-        self.redis
-            .xack(&self.key, &self.group, &[delivery_tag])
-            .await?;
-        Ok(())
     }
 }
 
 pub struct Delivery {
+    pub key: String,
     pub payload: Vec<u8>,
     pub delivery_tag: String,
 }
 
 impl Delivery {
-    fn from_stream_id(msg: &StreamId) -> Result<Self, Error> {
+    fn from_stream_id(key: String, msg: &StreamId) -> Result<Self, Error> {
         match &msg.map["payload"] {
             Value::Data(payload) => Ok(Delivery {
+                key,
                 payload: payload.clone(),
                 delivery_tag: msg.id.clone(),
             }),
@@ -254,4 +358,5 @@ impl Delivery {
 
 pub struct Message {
     pub payload: Vec<u8>,
+    pub priority: Option<u8>,
 }

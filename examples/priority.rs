@@ -1,28 +1,15 @@
-use clap::Parser;
 use rampqueue::{Connection, Error};
 use std::time::Duration;
 
-#[derive(clap::Parser)]
-struct Args {
-    #[arg(short, long)]
-    consumer_name: Option<String>,
-}
-
 #[tokio::main]
 pub async fn main() -> Result<(), Error> {
-    let args = Args::parse();
-
     env_logger::init();
 
-    let mut conn = Connection::new("redis://localhost", "demo").await?;
+    let mut conn = Connection::new("redis://localhost", "priority").await?;
 
-    conn.declare_queue("demo").await?;
+    conn.declare_priority_queue("demo", 3).await?;
 
-    let mut consumer = if let Some(consumer_name) = args.consumer_name {
-        conn.consume_named("demo", consumer_name).await?
-    } else {
-        conn.consume("demo").await?
-    };
+    let mut consumer = conn.consume("demo").await?;
 
     loop {
         let d = consumer.try_next().await?;
