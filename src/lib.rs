@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use log::trace;
 use redis::aio::ConnectionLike;
 use redis::streams::{
@@ -9,6 +10,7 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::time::Duration;
 use tokio::time::Instant;
+use binary_heap_plus::{BinaryHeap, MinComparator};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -151,11 +153,12 @@ impl Connection {
     ) -> Result<Consumer, Error> {
         Ok(Consumer {
             redis: self.client.get_tokio_connection().await?,
-            last_id: std::iter::repeat("0-0".to_owned()).take(keys.len()).collect(),
+            last_id: std::iter::repeat(">".to_owned()).take(keys.len()).collect(),
             keys,
             group: "primary".to_owned(),
             consumer: consumer.into(),
             next_maintenance: Instant::now(),
+            prefetch: BinaryHeap::new_min(),
         })
     }
 }
@@ -169,6 +172,7 @@ pub struct Consumer {
     group: String,
     consumer: String,
     next_maintenance: Instant,
+    prefetch: BinaryHeap<Delivery, MinComparator>
 }
 
 impl Debug for Consumer {
@@ -190,6 +194,11 @@ impl Consumer {
     pub async fn try_next(&mut self) -> Result<Delivery, Error> {
         trace!("try next: {:?}", self);
 
+        /*if let Some(delivery) = self.prefetch.pop() {
+            trace!("returning entry from prefetch");
+            return Ok(delivery);
+        }*/
+
         loop {
             if self.next_maintenance < Instant::now() {
                 self.do_maintenance().await?;
@@ -199,40 +208,52 @@ impl Consumer {
                 return Ok(delivery);
             }
 
-            let options = StreamReadOptions::default()
-                .group(&self.group, &self.consumer)
-                .block(READ_BLOCK_TIMEOUT)
-                .count(1);
+            trace!("waiting for entries");
 
-            trace!("read from id: {:?}", self.last_id);
+            let options = {
+                let options = StreamReadOptions::default()
+                    .group(&self.group, &self.consumer)
+                    .count(1);
+
+                if self.prefetch.is_empty() {
+                    trace!("no entries prefetched, blocking read");
+                    options.block(READ_BLOCK_TIMEOUT)
+                } else {
+                    options
+                }
+            };
+
             let read: Option<StreamReadReply> = self.redis
                 .xread_options(&self.keys, &self.last_id, &options)
                 .await?;
 
             if !read.is_some() {
+                if let Some(delivery) = self.prefetch.pop() {
+                    return Ok(delivery);
+                }
                 trace!("no entries read within timeout, check pending again");
                 continue;
             }
             let read = read.unwrap();
 
-            let iter = read.keys
-                .into_iter()
-                .zip(self.last_id.iter_mut());
-            for (key, last_id) in iter {
+            for key in read.keys {
                 if key.ids.is_empty() {
-                    trace!("no entries returned for {}, wait for new entries", key.key);
-                    *last_id = ">".to_owned();
-                    continue;
+                    trace!("no entries returned for {}", key.key);
+                } else {
+                    let msg = &key.ids[0];
+                    trace!("read entry from key {}, id is: {}", key.key, msg.id);
+
+                    let delivery = Delivery::from_stream_id(key.key, msg)?;
+                    self.prefetch.push(delivery);
+
                 }
-
-                let msg = &key.ids[0];
-                trace!("read entry, next id is: {}", msg.id);
-                *last_id = msg.id.clone();
-
-                return Delivery::from_stream_id(key.key, msg);
             }
 
-            trace!("no entries returned for any key");
+            if let Some(delivery) = self.prefetch.pop() {
+                return Ok(delivery);
+            }
+
+            trace!("no entries returned for any key, wait for new entries");
         }
     }
 
@@ -254,9 +275,13 @@ impl Consumer {
             for consumer in info.consumers {
                 if consumer.idle > IDLE_TIMEOUT * CONSUMER_IDLE_MULTIPLIER {
                     trace!("consumer {} has been idle too long", consumer.name);
-                    self.redis
-                        .xgroup_delconsumer(key, &self.group, consumer.name)
-                        .await?;
+                    if consumer.pending > 0 {
+                        trace!("consumer {} has {} pending entries", consumer.name, consumer.pending);
+                    } else {
+                        self.redis
+                            .xgroup_delconsumer(key, &self.group, consumer.name)
+                            .await?;
+                    }
                 }
             }
 
@@ -353,6 +378,26 @@ impl Delivery {
             }),
             _ => Err(Error::NoPayload),
         }
+    }
+}
+
+impl Eq for Delivery {}
+
+impl PartialEq<Self> for Delivery {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.delivery_tag == other.delivery_tag
+    }
+}
+
+impl PartialOrd<Self> for Delivery {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Delivery {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key.cmp(&other.key).then(self.delivery_tag.cmp(&other.delivery_tag))
     }
 }
 
