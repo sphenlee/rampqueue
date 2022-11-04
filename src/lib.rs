@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use log::trace;
 use redis::aio::ConnectionLike;
 use redis::streams::{
@@ -10,7 +9,6 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::time::Duration;
 use tokio::time::Instant;
-use binary_heap_plus::{BinaryHeap, MinComparator};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -158,7 +156,6 @@ impl Connection {
             group: "primary".to_owned(),
             consumer: consumer.into(),
             next_maintenance: Instant::now(),
-            prefetch: BinaryHeap::new_min(),
         })
     }
 }
@@ -172,7 +169,6 @@ pub struct Consumer {
     group: String,
     consumer: String,
     next_maintenance: Instant,
-    prefetch: BinaryHeap<Delivery, MinComparator>
 }
 
 impl Debug for Consumer {
@@ -194,11 +190,6 @@ impl Consumer {
     pub async fn try_next(&mut self) -> Result<Delivery, Error> {
         trace!("try next: {:?}", self);
 
-        /*if let Some(delivery) = self.prefetch.pop() {
-            trace!("returning entry from prefetch");
-            return Ok(delivery);
-        }*/
-
         loop {
             if self.next_maintenance < Instant::now() {
                 self.do_maintenance().await?;
@@ -208,52 +199,48 @@ impl Consumer {
                 return Ok(delivery);
             }
 
-            trace!("waiting for entries");
+            trace!("checking for entries");
 
-            let options = {
-                let options = StreamReadOptions::default()
-                    .group(&self.group, &self.consumer)
-                    .count(1);
+            let options = StreamReadOptions::default()
+                .group(&self.group, &self.consumer)
+                .count(1);
 
-                if self.prefetch.is_empty() {
-                    trace!("no entries prefetched, blocking read");
-                    options.block(READ_BLOCK_TIMEOUT)
-                } else {
-                    options
+            for key in &self.keys {
+                let read: Option<StreamReadReply> = self.redis
+                    .xread_options(&[key], &[">"], &options)
+                    .await?;
+
+                if !read.is_some() {
+                    trace!("no entries for key {}", key);
+                    continue;
                 }
-            };
+
+                let read = read.unwrap();
+
+                let msg = &read.keys[0].ids[0];
+                trace!("read entry from key {}, id is: {}", key, msg.id);
+                return Delivery::from_stream_id(key.clone(), msg);
+            }
+
+            trace!("no entries returned for any key, wait for new entries");
+            let options = StreamReadOptions::default()
+                .group(&self.group, &self.consumer)
+                .block(READ_BLOCK_TIMEOUT);
 
             let read: Option<StreamReadReply> = self.redis
                 .xread_options(&self.keys, &self.last_id, &options)
                 .await?;
 
             if !read.is_some() {
-                if let Some(delivery) = self.prefetch.pop() {
-                    return Ok(delivery);
-                }
                 trace!("no entries read within timeout, check pending again");
                 continue;
             }
+
             let read = read.unwrap();
-
-            for key in read.keys {
-                if key.ids.is_empty() {
-                    trace!("no entries returned for {}", key.key);
-                } else {
-                    let msg = &key.ids[0];
-                    trace!("read entry from key {}, id is: {}", key.key, msg.id);
-
-                    let delivery = Delivery::from_stream_id(key.key, msg)?;
-                    self.prefetch.push(delivery);
-
-                }
-            }
-
-            if let Some(delivery) = self.prefetch.pop() {
-                return Ok(delivery);
-            }
-
-            trace!("no entries returned for any key, wait for new entries");
+            let key = &read.keys[0];
+            let msg = &key.ids[0];
+            trace!("read entry from key {}, id is: {}", key.key, msg.id);
+            return Delivery::from_stream_id(key.key.clone(), msg);
         }
     }
 
@@ -378,26 +365,6 @@ impl Delivery {
             }),
             _ => Err(Error::NoPayload),
         }
-    }
-}
-
-impl Eq for Delivery {}
-
-impl PartialEq<Self> for Delivery {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && self.delivery_tag == other.delivery_tag
-    }
-}
-
-impl PartialOrd<Self> for Delivery {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Delivery {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.key.cmp(&other.key).then(self.delivery_tag.cmp(&other.delivery_tag))
     }
 }
 
